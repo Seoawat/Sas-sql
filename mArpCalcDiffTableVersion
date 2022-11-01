@@ -1,0 +1,103 @@
+/* Предполагается, что таблицы со списками ключей находятся в tmp схеме */
+
+
+%macro mArpDecomCalcDiffTableVersion (
+	mpConnect				= ,
+	mpMsSqlDatabase			= ,
+	mpMsSqlDataSchema		= ,
+	mpMsSqlDataTable		= ,
+	mpMsSqlTmpSchema		= ,
+	mpMsSqlSrcKeysTable 	= ,
+	mpMsSqlTrgKeysTable		= ,
+	mpKeyColumnName			= ,
+	mpKeyCompareColumnName	= ,
+	mpDiffColumnName		=
+);
+
+	%local mvDataColumnList_dt /* Список полей (без сравниваемого ключа) таблицы с данными с префиксом dt.*/
+	
+	;
+
+	proc sql noprint;
+		connect to sqlsvr(&mpConnect);
+		
+		execute (use &mpMsSqlDatabase;) by sqlsvr;
+		
+		select 'dt.' || column_name
+		into :mvDataColumnList_dt separated by ", "
+		from connection to sqlsvr(
+			select column_name 
+			from information_schema.columns 
+			where 1=1
+				and table_catalog 	= %str(%')&mpMsSqlDatabase%str(%')
+				and table_schema	= %str(%')&mpMsSqlDataSchema%str(%')
+				and table_name 		= %str(%')&mpMsSqlDataTable%str(%')
+				and column_name		<> %str(%')&mpKeyColumnName%str(%')
+			order by ordinal_position
+		);
+		
+		execute (
+				IF OBJECT_ID (%str(%')&mpMsSqlTmpSchema..&mpMsSqlTrgKeysTable.%str(%'), 'U') IS NOT NULL
+				DROP TABLE &mpMsSqlTmpSchema..&mpMsSqlTrgKeysTable;
+			) by sqlsvr;
+		
+		execute (begin transaction;) by sqlsvr;
+		
+		execute (
+			with 
+				data1 as 
+				(
+					select dt.&mpKeyColumnName, &mvDataColumnList_dt
+					from &mpMsSqlDataSchema..&mpMsSqlDataTable as dt
+						inner join &mpMsSqlTmpSchema..&mpMsSqlSrcKeysTable as ks
+							on (
+								dt.&mpKeyColumnName = ks.&mpKeyColumnName
+							)
+				),
+				data2 as
+				(
+					select ks.&mpKeyColumnName, &mvDataColumnList_dt
+					from &mpMsSqlDataSchema..&mpMsSqlDataTable as dt
+					inner join &mpMsSqlTmpSchema..&mpMsSqlSrcKeysTable as ks
+							on (
+								dt.&mpKeyColumnName = ks.&mpKeyCompareColumnName
+							)
+				)
+			select 	ks.*,
+					cast(case 
+						when diff.&mpKeyColumnName is not null or ks.&mpKeyColumnName is null or ks.&mpKeyCompareColumnName is null then '1' 
+						else '0'
+					end as nchar(1)) as &mpDiffColumnName
+			into &mpMsSqlTmpSchema..&mpMsSqlTrgKeysTable
+			from &mpMsSqlTmpSchema..&mpMsSqlSrcKeysTable as ks
+				left join 
+						(
+							select distinct &mpKeyColumnName
+							from (
+									(
+										select * from data1
+										except
+										select * from data2
+									)
+									union all
+									(
+										select * from data2
+										except
+										select * from data1
+									)
+								) as df
+						) as diff
+					on ( ks.&mpKeyColumnName = diff.&mpKeyColumnName )
+		) by sqlsvr;
+		execute (commit transaction) by sqlsvr;
+		
+		disconnect from sqlsvr;
+	quit;
+	
+	%if (&sysrc ^= 0 and &sysrc ^= 4) %then %do;
+		%put ARP:ERROR: Calculate diff finish with error. syscc = &syscc;
+		%abort ABEND;
+	%end;
+	
+	
+%mend mArpDecomCalcDiffTableVersion;
