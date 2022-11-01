@@ -1,0 +1,135 @@
+/* 
+Предполагается, что таблицы со списками ключей находятся в tmp схеме 
+mpMsSqlDataTableList - список таблиц через пробел
+*/
+/*
+Пример:
+%mArpDecomCalcDiffVersion (
+	mpConnect				= &ADWH_ARP_MSSQL_CONNECT,
+	mpMsSqlDatabase			= &ADWH_ARP_MSSQL_DB_NAME,
+	mpMsSqlDataSchema		= &ADWH_ARP_MSSQL_SCHEMA_NAME,
+	mpMsSqlDataTableList	= &ADWH_ARP_DECOM_DATA_LIST,
+	mpMsSqlTmpSchema		= &ADWH_ARP_MSSQL_TMP_SCHEMA_NAME,
+	mpMsSqlSrcKeysTable 	= test1,
+	mpMsSqlTrgKeysTable		= test2,
+	mpKeyColumnName			= decom_version_rk,
+	mpKeyCompareColumnName	= new_decom_version_rk,
+	mpDiffColumnName		= diff_flg
+);
+*/
+
+%macro mArpDecomCalcDiffVersion (
+	mpConnect				= ,
+	mpMsSqlDatabase			= ,
+	mpMsSqlDataSchema		= ,
+	mpMsSqlDataTableList	= ,
+	mpMsSqlTmpSchema		= ,
+	mpMsSqlSrcKeysTable 	= ,
+	mpMsSqlTrgKeysTable		= ,
+	mpKeyColumnName			= ,
+	mpKeyCompareColumnName	= ,
+	mpDiffColumnName		=
+);
+
+	%local mvk mvMsSqlDataTable mvMsSqlSrcKeysTable mvMsSqlTrgKeysTable mvSuffix;
+	%local mvSrcKeysTableColumnList; /* Список полей входной таблицы с ключами */
+	%local mvDiffExpression; /* Выражение из промежуточных названий diff столбцов, что определения конечного результата diff */
+	
+	%let mvk = 1;
+	%let mvSuffix = %StrUnique( mpSeed = &mpMsSqlTrgKeysTable, mpLength = 10 ); 
+	%let mvDiffExpression = ;
+
+		proc sql noprint;
+		connect to sqlsvr(&mpConnect);
+		
+		execute (use &mpMsSqlDatabase;) by sqlsvr;
+		
+		select column_name
+		into :mvSrcKeysTableColumnList separated by ", "
+		from connection to sqlsvr(
+			select column_name 
+			from information_schema.columns 
+			where 1=1
+				and table_catalog 	= %str(%')&mpMsSqlDatabase%str(%')
+				and table_schema	= %str(%')&mpMsSqlTmpSchema%str(%')
+				and table_name 		= %str(%')&mpMsSqlSrcKeysTable%str(%')
+			order by ordinal_position
+		);
+		
+		disconnect from sqlsvr;
+	quit;
+
+	%do %while(%scan(&mpMsSqlDataTableList, &mvk, %str( )) ^= );
+	
+		/* Название таблицы с данными */
+		%let mvMsSqlDataTable = %scan(&mpMsSqlDataTableList, &mvk, %str( ));
+		/* Название входной промежуточной таблицы с ключами */
+		%if ( &mvk > 1 ) %then 	%let mvMsSqlSrcKeysTable = TMP_KEYS_%eval(&mvk-1)_&mvSuffix;
+		%else 					%let mvMsSqlSrcKeysTable = &mpMsSqlSrcKeysTable;
+		/* Название выходной промежуточной таблицы с ключами */
+		%let mvMsSqlTrgKeysTable = TMP_KEYS_&mvk._&mvSuffix;
+		
+		/* Запуск для одной таблицы */
+		%mArpDecomCalcDiffTableVersion(
+			mpConnect				= &mpConnect,
+			mpMsSqlDatabase			= &mpMsSqlDatabase,
+			mpMsSqlDataSchema		= &mpMsSqlDataSchema,
+			mpMsSqlDataTable		= &mvMsSqlDataTable,
+			mpMsSqlTmpSchema		= &mpMsSqlTmpSchema,
+			mpMsSqlSrcKeysTable 	= &mvMsSqlSrcKeysTable,
+			mpMsSqlTrgKeysTable		= &mvMsSqlTrgKeysTable,
+			mpKeyColumnName			= &mpKeyColumnName,
+			mpKeyCompareColumnName	= &mpKeyCompareColumnName,
+			mpDiffColumnName		= DIFF_COL_TMP_&mvk
+		);
+		
+		%if &mvk = 1 %then 	%let mvDiffExpression = DIFF_COL_TMP_&mvk = '1';
+		%else 				%let mvDiffExpression = &mvDiffExpression OR DIFF_COL_TMP_&mvk = '1';
+		
+		%let mvk = %eval(&mvk + 1);
+	%end;
+
+	%let mvk = %eval(&mvk - 1);
+
+	proc sql noprint;
+		connect to sqlsvr(&mpConnect);
+		
+		execute (use &mpMsSqlDatabase;) by sqlsvr;
+		
+		execute (
+			IF OBJECT_ID (%str(%')&mpMsSqlTmpSchema..&mpMsSqlTrgKeysTable.%str(%'), 'U') IS NOT NULL
+			DROP TABLE &mpMsSqlTmpSchema..&mpMsSqlTrgKeysTable;
+		) by sqlsvr;
+		
+		execute (begin transaction;) by sqlsvr;
+		execute (
+			select &mvSrcKeysTableColumnList, 
+				cast(case 
+					when &mvDiffExpression then '1'
+					else '0'
+				end as nchar(1)) as &mpDiffColumnName
+			into &mpMsSqlTmpSchema..&mpMsSqlTrgKeysTable
+			from &mpMsSqlTmpSchema..&mvMsSqlTrgKeysTable
+		) by sqlsvr;
+		execute (commit transaction) by sqlsvr;
+		/* Удаление после себя */
+		/*%do %while( mvk>0 );
+			%let mvMsSqlTrgKeysTable = TMP_KEYS_&mvk._&mvSuffix;
+		
+			execute (
+				IF OBJECT_ID (%str(%')&mpMsSqlTmpSchema..&mvMsSqlTrgKeysTable.%str(%'), 'U') IS NOT NULL
+				DROP TABLE &mpMsSqlTmpSchema..&mvMsSqlTrgKeysTable;
+			) by sqlsvr;
+			%let mvk = %eval(&mvk - 1);
+		%end;*/
+		
+		disconnect from sqlsvr;
+	quit;
+	
+	%if (&sysrc ^= 0 and &sysrc ^= 4) %then %do;
+		%put ARP:ERROR: Calculate diff finish with error. syscc = &syscc;
+		%abort ABEND;
+	%end;
+	
+	
+%mend mArpDecomCalcDiffVersion;
